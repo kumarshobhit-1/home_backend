@@ -146,7 +146,7 @@ if (PRIVATE_KEY && CONTRACT_ADDRESS) {
 
 app.use(
 	cors({
-		origin: process.env.CORS_ORIGIN || true,
+		origin: 'https://home-frontend-neon.vercel.app',
 		methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 		credentials: true,
 	})
