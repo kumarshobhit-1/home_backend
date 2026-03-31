@@ -13,7 +13,11 @@ const MQTT_STATUS_TOPIC = process.env.MQTT_STATUS_TOPIC || 'bbd-smarthome/status
 const BLOCKCHAIN_RPC_URL = process.env.BLOCKCHAIN_RPC_URL || 'http://127.0.0.1:7545';
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const TELEGRAM_CHAT_IDS = (process.env.TELEGRAM_CHAT_IDS || process.env.TELEGRAM_CHAT_ID || '')
+	.split(',')
+	.map((id) => id.trim())
+	.filter(Boolean);
+const TELEGRAM_TIMEZONE = process.env.TELEGRAM_TIMEZONE || 'Asia/Kolkata';
 
 const ALLOWED_COMMANDS = new Set([
 	'DOOR_OPEN',
@@ -89,21 +93,42 @@ function broadcastStatus(statusPayload) {
 }
 
 async function sendTelegramAlert(message) {
-	if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+	if (!TELEGRAM_BOT_TOKEN || TELEGRAM_CHAT_IDS.length === 0) {
 		return;
 	}
 
 	try {
-		await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				chat_id: TELEGRAM_CHAT_ID,
-				text: message,
-			}),
-		});
+		await Promise.all(
+			TELEGRAM_CHAT_IDS.map((chatId) =>
+				fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						chat_id: chatId,
+						text: message,
+					}),
+				})
+			)
+		);
 	} catch (err) {
 		console.warn(`[${new Date().toISOString()}] Telegram alert failed (non-fatal):`, err.message);
+	}
+}
+
+function formatTelegramTime(date = new Date()) {
+	try {
+		return new Intl.DateTimeFormat('en-IN', {
+			timeZone: TELEGRAM_TIMEZONE,
+			year: 'numeric',
+			month: '2-digit',
+			day: '2-digit',
+			hour: '2-digit',
+			minute: '2-digit',
+			second: '2-digit',
+			hour12: true,
+		}).format(date);
+	} catch {
+		return date.toISOString();
 	}
 }
 
@@ -267,7 +292,7 @@ app.post('/api/device/control', (req, res) => {
 		}
 
 		sendTelegramAlert(
-			`SmartHome Alert\nAction: ${safeDevice} ${command}\nUser: ${safeUser}\nTime: ${new Date().toLocaleString()}`
+			`SmartHome Alert\nAction: ${safeDevice} ${command}\nUser: ${safeUser}\nTime: ${formatTelegramTime()} (${TELEGRAM_TIMEZONE})`
 		);
 
 		res.status(200).json(responsePayload);
