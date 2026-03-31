@@ -19,6 +19,7 @@ const TELEGRAM_CHAT_IDS = (process.env.TELEGRAM_CHAT_IDS || process.env.TELEGRAM
 	.map((id) => id.trim())
 	.filter(Boolean);
 const TELEGRAM_TIMEZONE = process.env.TELEGRAM_TIMEZONE || 'Asia/Kolkata';
+const TELEGRAM_POLL_INTERVAL_MS = Number(process.env.TELEGRAM_POLL_INTERVAL_MS) || 1500;
 
 const ALLOWED_COMMANDS = new Set([
 	'DOOR_OPEN',
@@ -93,6 +94,21 @@ function broadcastStatus(statusPayload) {
 	}
 }
 
+async function sendTelegramMessage(chatId, message) {
+	if (!TELEGRAM_BOT_TOKEN || !chatId) {
+		return;
+	}
+
+	await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			chat_id: chatId,
+			text: message,
+		}),
+	});
+}
+
 async function sendTelegramAlert(message) {
 	if (!TELEGRAM_BOT_TOKEN || TELEGRAM_CHAT_IDS.length === 0) {
 		return;
@@ -100,16 +116,7 @@ async function sendTelegramAlert(message) {
 
 	try {
 		await Promise.all(
-			TELEGRAM_CHAT_IDS.map((chatId) =>
-				fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({
-						chat_id: chatId,
-						text: message,
-					}),
-				})
-			)
+			TELEGRAM_CHAT_IDS.map((chatId) => sendTelegramMessage(chatId, message))
 		);
 	} catch (err) {
 		console.warn(`[${new Date().toISOString()}] Telegram alert failed (non-fatal):`, err.message);
@@ -130,6 +137,182 @@ function formatTelegramTime(date = new Date()) {
 		}).format(date);
 	} catch {
 		return date.toISOString();
+	}
+}
+
+function getTelegramHelpText() {
+	return [
+		'SmartHome Bot Commands',
+		'/status',
+		'/door_open or /door_close',
+		'/light_on or /light_off',
+		'/fan_on or /fan_off',
+		'/mcb_off or /mcb_on',
+	].join('\n');
+}
+
+function parseTelegramControlCommand(text) {
+	const normalized = String(text || '')
+		.trim()
+		.toUpperCase()
+		.replace(/\s+/g, '_');
+
+	const commandMap = {
+		'/DOOR_OPEN': { device: 'Main Door', command: 'DOOR_OPEN' },
+		'/DOOR_CLOSE': { device: 'Main Door', command: 'DOOR_CLOSE' },
+		'/UNLOCK': { device: 'Main Door', command: 'DOOR_OPEN' },
+		'/LOCK': { device: 'Main Door', command: 'DOOR_CLOSE' },
+		'/LIGHT_ON': { device: 'Living Room Light', command: 'LIGHT_ON' },
+		'/LIGHT_OFF': { device: 'Living Room Light', command: 'LIGHT_OFF' },
+		'/FAN_ON': { device: 'Ceiling Fan', command: 'FAN_ON' },
+		'/FAN_OFF': { device: 'Ceiling Fan', command: 'FAN_OFF' },
+		'/MCB_OFF': { device: 'Master System', command: 'MCB_OFF' },
+		'/MCB_ON': { device: 'Master System', command: 'MCB_ON' },
+	};
+
+	return commandMap[normalized] || null;
+}
+
+async function executeDeviceControl({ device, command, safeUser }) {
+	if (!device || !command) {
+		throw new Error('Invalid payload. device and command are required');
+	}
+
+	if (!ALLOWED_COMMANDS.has(command)) {
+		throw new Error('Unsupported command');
+	}
+
+	const safeDevice = String(device).slice(0, 120);
+	const actor = String(safeUser || FORCED_USER_NAME).slice(0, 120);
+
+	await new Promise((resolve, reject) => {
+		mqttClient.publish(MQTT_CONTROL_TOPIC, command, (err) => {
+			if (err) {
+				reject(new Error('Failed to publish device command'));
+				return;
+			}
+			resolve();
+		});
+	});
+
+	let transactionHash = null;
+
+	if (contract && provider && wallet) {
+		try {
+			const action = `${safeDevice} ${command}`;
+			const timestamp = Math.floor(Date.now() / 1000);
+
+			console.log(`[${new Date().toISOString()}] Blockchain: Calling addLog('${action}', '${actor}', ${timestamp})`);
+
+			const tx = await contract.addLog(action, actor, timestamp);
+			transactionHash = tx.hash;
+
+			console.log(`[${new Date().toISOString()}] Blockchain: Transaction sent, hash: ${transactionHash}`);
+
+			const receipt = await tx.wait();
+
+			console.log(`[${new Date().toISOString()}] Blockchain: Transaction confirmed, block: ${receipt.blockNumber}`);
+		} catch (blockchainErr) {
+			console.error(`[${new Date().toISOString()}] Blockchain error (non-fatal):`, blockchainErr.message);
+		}
+	}
+
+	const alertText = `SmartHome Alert\nAction: ${safeDevice} ${command}\nUser: ${actor}\nTime: ${formatTelegramTime()} (${TELEGRAM_TIMEZONE})`;
+	await sendTelegramAlert(alertText);
+
+	return {
+		safeDevice,
+		command,
+		actor,
+		transactionHash,
+	};
+}
+
+let telegramUpdateOffset = 0;
+
+async function handleTelegramMessage(message) {
+	if (!message || !message.chat || typeof message.text !== 'string') {
+		return;
+	}
+
+	const chatId = String(message.chat.id);
+	const isAllowedChat = TELEGRAM_CHAT_IDS.length === 0 || TELEGRAM_CHAT_IDS.includes(chatId);
+
+	if (!isAllowedChat) {
+		await sendTelegramMessage(chatId, 'Unauthorized chat. Ask admin to add your chat id.');
+		return;
+	}
+
+	const text = message.text.trim();
+	const normalized = text.toLowerCase();
+
+	if (normalized === '/start' || normalized === '/help') {
+		await sendTelegramMessage(chatId, getTelegramHelpText());
+		return;
+	}
+
+	if (normalized === '/status') {
+		const statusText = [
+			'SmartHome Status',
+			`Temp: ${typeof latestDeviceStatus.temp === 'number' ? `${latestDeviceStatus.temp.toFixed(1)} C` : 'N/A'}`,
+			`Humidity: ${typeof latestDeviceStatus.hum === 'number' ? `${latestDeviceStatus.hum.toFixed(1)} %` : 'N/A'}`,
+			`MCB: ${latestDeviceStatus.mcb_status ? 'ON' : 'OFF'}`,
+			`Updated: ${latestDeviceStatus.updatedAt ? formatTelegramTime(new Date(latestDeviceStatus.updatedAt)) : 'N/A'}`,
+		].join('\n');
+
+		await sendTelegramMessage(chatId, statusText);
+		return;
+	}
+
+	const control = parseTelegramControlCommand(text);
+	if (!control) {
+		await sendTelegramMessage(chatId, `Unknown command.\n\n${getTelegramHelpText()}`);
+		return;
+	}
+
+	try {
+		const result = await executeDeviceControl({
+			device: control.device,
+			command: control.command,
+			safeUser: FORCED_USER_NAME,
+		});
+
+		await sendTelegramMessage(
+			chatId,
+			`Command executed\nAction: ${result.safeDevice} ${result.command}\nUser: ${result.actor}${
+				result.transactionHash ? `\nTx: ${result.transactionHash}` : ''
+			}`
+		);
+	} catch (err) {
+		console.error(`[${new Date().toISOString()}] Telegram command error:`, err.message);
+		await sendTelegramMessage(chatId, `Command failed: ${err.message}`);
+	}
+}
+
+async function pollTelegramUpdates() {
+	if (!TELEGRAM_BOT_TOKEN) {
+		return;
+	}
+
+	try {
+		const updatesUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?timeout=25&offset=${telegramUpdateOffset}`;
+		const response = await fetch(updatesUrl);
+		const payload = await response.json();
+
+		if (!payload.ok || !Array.isArray(payload.result)) {
+			throw new Error(payload.description || 'Telegram getUpdates failed');
+		}
+
+		for (const update of payload.result) {
+			telegramUpdateOffset = update.update_id + 1;
+			if (update.message) {
+				await handleTelegramMessage(update.message);
+			}
+		}
+	} catch (err) {
+		console.warn(`[${new Date().toISOString()}] Telegram polling warning:`, err.message);
+	} finally {
+		setTimeout(pollTelegramUpdates, TELEGRAM_POLL_INTERVAL_MS);
 	}
 }
 
@@ -238,66 +421,28 @@ app.get('/api/device/stream', (req, res) => {
 app.post('/api/device/control', (req, res) => {
 	const { device, command } = req.body || {};
 
-	if (!device || !command) {
-		return res.status(400).json({
-			error: 'Invalid payload. device and command are required',
-		});
-	}
+	executeDeviceControl({
+		device,
+		command,
+		safeUser: FORCED_USER_NAME,
+	})
+		.then((result) => {
+			const responsePayload = {
+				success: true,
+				message: 'Device command published successfully',
+				topic: MQTT_CONTROL_TOPIC,
+			};
 
-	if (!ALLOWED_COMMANDS.has(command)) {
-		return res.status(400).json({ error: 'Unsupported command' });
-	}
-
-	const safeDevice = String(device).slice(0, 120);
-	const safeUser = String(FORCED_USER_NAME).slice(0, 120);
-
-	const payload = command;
-
-	mqttClient.publish(MQTT_CONTROL_TOPIC, payload, async (err) => {
-		if (err) {
-			return res.status(500).json({ error: 'Failed to publish device command' });
-		}
-
-		let transactionHash = null;
-
-		// Blockchain logging
-		if (contract && provider && wallet) {
-			try {
-				const action = `${safeDevice} ${command}`;
-				const timestamp = Math.floor(Date.now() / 1000);
-
-				console.log(`[${new Date().toISOString()}] Blockchain: Calling addLog('${action}', '${safeUser}', ${timestamp})`);
-
-				const tx = await contract.addLog(action, safeUser, timestamp);
-				transactionHash = tx.hash;
-
-				console.log(`[${new Date().toISOString()}] Blockchain: Transaction sent, hash: ${transactionHash}`);
-
-				const receipt = await tx.wait();
-
-				console.log(`[${new Date().toISOString()}] Blockchain: Transaction confirmed, block: ${receipt.blockNumber}`);
-			} catch (blockchainErr) {
-				console.error(`[${new Date().toISOString()}] Blockchain error (non-fatal):`, blockchainErr.message);
-				// Don't crash the server; still return success for MQTT publish
+			if (result.transactionHash) {
+				responsePayload.transactionHash = result.transactionHash;
 			}
-		}
 
-		const responsePayload = {
-			success: true,
-			message: 'Device command published successfully',
-			topic: MQTT_CONTROL_TOPIC,
-		};
-
-		if (transactionHash) {
-			responsePayload.transactionHash = transactionHash;
-		}
-
-		sendTelegramAlert(
-			`SmartHome Alert\nAction: ${safeDevice} ${command}\nUser: ${safeUser}\nTime: ${formatTelegramTime()} (${TELEGRAM_TIMEZONE})`
-		);
-
-		res.status(200).json(responsePayload);
-	});
+			res.status(200).json(responsePayload);
+		})
+		.catch((err) => {
+			const statusCode = err.message === 'Unsupported command' || err.message.includes('Invalid payload') ? 400 : 500;
+			res.status(statusCode).json({ error: err.message });
+		});
 });
 
 app.use((req, res) => {
@@ -318,5 +463,9 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
 	console.log(`[${new Date().toISOString()}] Server started on port ${PORT}`);
+	if (TELEGRAM_BOT_TOKEN) {
+		console.log(`[${new Date().toISOString()}] Telegram command polling enabled`);
+		pollTelegramUpdates();
+	}
 });
 
