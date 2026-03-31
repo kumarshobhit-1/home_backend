@@ -146,7 +146,7 @@ if (PRIVATE_KEY && CONTRACT_ADDRESS) {
 
 app.use(
 	cors({
-		origin: 'https://homeiotsecure.vercel.app/',
+		origin: 'https://homeiotsecure.vercel.app',
 		methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 		credentials: true,
 	})
