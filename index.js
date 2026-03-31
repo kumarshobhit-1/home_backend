@@ -11,6 +11,7 @@ const MQTT_BROKER_URL = process.env.MQTT_BROKER_URL || 'mqtt://broker.hivemq.com
 const MQTT_CONTROL_TOPIC = process.env.MQTT_CONTROL_TOPIC || 'bbd-smarthome/control';
 const MQTT_STATUS_TOPIC = process.env.MQTT_STATUS_TOPIC || 'bbd-smarthome/status';
 const BLOCKCHAIN_RPC_URL = process.env.BLOCKCHAIN_RPC_URL || 'http://127.0.0.1:7545';
+const FORCED_USER_NAME = process.env.FORCED_USER_NAME || 'Admin (BBDU)';
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_IDS = (process.env.TELEGRAM_CHAT_IDS || process.env.TELEGRAM_CHAT_ID || '')
@@ -235,11 +236,11 @@ app.get('/api/device/stream', (req, res) => {
 });
 
 app.post('/api/device/control', (req, res) => {
-	const { device, command, user } = req.body || {};
+	const { device, command } = req.body || {};
 
-	if (!device || !command || !user) {
+	if (!device || !command) {
 		return res.status(400).json({
-			error: 'Invalid payload. device, command, and user are required',
+			error: 'Invalid payload. device and command are required',
 		});
 	}
 
@@ -248,7 +249,7 @@ app.post('/api/device/control', (req, res) => {
 	}
 
 	const safeDevice = String(device).slice(0, 120);
-	const safeUser = String(user).slice(0, 120);
+	const safeUser = String(FORCED_USER_NAME).slice(0, 120);
 
 	const payload = command;
 
